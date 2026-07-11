@@ -1,0 +1,46 @@
+version: 2
+project_name: completionctl
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: .
+    binary: completionctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native
+
+brews:
+  - name: completionctl
+    repository:
+      owner: malh
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/malh/completionctl
+    description: Manage generated Zsh completion definitions with provenance and safe updates
+    license: MIT
+    install: |
+      bin.install "completionctl"
+      generate_completions_from_executable(bin/"completionctl", "completion", shells: [:zsh])
+    test: |
+      system "#{bin}/completionctl", "--version"
