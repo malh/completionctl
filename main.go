@@ -32,6 +32,8 @@ type metadata struct {
 	Tool, Source, Executable string
 	Args                     []string
 	ImportSource, Parser     string
+	MaxDepth, MaxCommands    int   `json:",omitempty"`
+	MaxOutput                int64 `json:",omitempty"`
 }
 type app struct {
 	dir     string
@@ -136,7 +138,8 @@ func validMetadata(m metadata) bool {
 	case "native":
 		return m.Executable != "" && len(m.Args) > 0 && m.ImportSource == "" && m.Parser == ""
 	case "help":
-		return m.Executable != "" && len(m.Args) > 0 && m.ImportSource == "" && m.Parser == "flat-options-v1"
+		return m.Executable != "" && len(m.Args) > 0 && m.ImportSource == "" &&
+			(m.Parser == "flat-options-v1" || (m.Parser == "command-tree-v1" && m.MaxDepth >= 0 && m.MaxCommands > 0 && m.MaxOutput > 0))
 	case "import":
 		return m.Executable == "" && len(m.Args) == 0 && m.ImportSource != "" && m.Parser == ""
 	default:
@@ -208,13 +211,16 @@ func mutation(tool string) error {
 	return f.Close()
 }
 func capture(path string, args []string, d time.Duration) ([]byte, error) {
+	return captureLimit(path, args, d, maxOutput)
+}
+func captureLimit(path string, args []string, d time.Duration, limit int64) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	c := exec.CommandContext(ctx, path, args...)
 	c.Stdin = nil
 	var out, er bytes.Buffer
-	c.Stdout = &limited{w: &out, n: maxOutput}
-	c.Stderr = &limited{w: &er, n: maxOutput}
+	c.Stdout = &limited{w: &out, n: limit}
+	c.Stderr = &limited{w: &er, n: limit}
 	e := c.Run()
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("command timed out")
@@ -245,15 +251,15 @@ func stripErrorPrefix(s string) string {
 
 type limited struct {
 	w io.Writer
-	n int
+	n int64
 }
 
 func (l *limited) Write(p []byte) (int, error) {
-	if len(p) > l.n {
+	if int64(len(p)) > l.n {
 		return 0, errors.New("output exceeds limit")
 	}
 	n, e := l.w.Write(p)
-	l.n -= n
+	l.n -= int64(n)
 	return n, e
 }
 func validate(tool string, b []byte) error {
@@ -375,7 +381,7 @@ func (a *app) install() *cobra.Command {
 		for _, ar := range sets {
 			b, e := capture(exe, ar, a.timeout)
 			if e == nil {
-				m := metadata{1, x[0], "native", exe, ar, "", ""}
+				m := metadata{Version: 1, Tool: x[0], Source: "native", Executable: exe, Args: ar}
 				if e = a.write(x[0], b, m); e == nil {
 					fmt.Fprintln(c.OutOrStdout(), paint(useColor.out, "32", "installed"), x[0])
 					return nil
@@ -414,12 +420,24 @@ func (a *app) updateOne(tool string) error {
 		}
 		return a.write(tool, b, m)
 	}
-	b, e = capture(m.Executable, m.Args, a.timeout)
-	if e != nil {
-		return e
-	}
 	if m.Source == "help" {
-		b, e = renderHelp(tool, b)
+		if m.Parser == "command-tree-v1" {
+			var tree commandTree
+			tree, e = a.discoverHelp(m.Executable, m.Args, discoveryLimits{m.MaxDepth, m.MaxCommands, m.MaxOutput})
+			if e == nil {
+				b, e = renderTree(tool, tree)
+			}
+		} else {
+			b, e = capture(m.Executable, m.Args, a.timeout)
+			if e == nil {
+				b, e = renderHelp(tool, b)
+			}
+		}
+		if e != nil {
+			return e
+		}
+	} else {
+		b, e = capture(m.Executable, m.Args, a.timeout)
 		if e != nil {
 			return e
 		}
@@ -519,7 +537,7 @@ func (a *app) importCmd() *cobra.Command {
 			return e
 		}
 		abs, _ := filepath.Abs(x[1])
-		if e = a.write(x[0], b, metadata{1, x[0], "import", "", nil, abs, ""}); e != nil {
+		if e = a.write(x[0], b, metadata{Version: 1, Tool: x[0], Source: "import", ImportSource: abs}); e != nil {
 			return e
 		}
 		fmt.Fprintln(c.OutOrStdout(), paint(useColor.out, "32", "imported"), x[0])
@@ -564,6 +582,7 @@ func firstLine(s string) string {
 func (a *app) generate() *cobra.Command {
 	var help []string
 	var force bool
+	limits := discoveryLimits{MaxDepth: 3, MaxCommands: 64, MaxOutput: maxOutput}
 	c := &cobra.Command{Use: "generate TOOL", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, x []string) error {
 		if len(help) == 0 {
 			help = []string{"--help"}
@@ -588,15 +607,16 @@ func (a *app) generate() *cobra.Command {
 				}
 			}
 		}
-		b, e := capture(exe, help, a.timeout)
+		tree, e := a.discoverHelp(exe, help, limits)
 		if e != nil {
 			return e
 		}
-		z, e := renderHelp(x[0], b)
+		z, e := renderTree(x[0], tree)
 		if e != nil {
 			return e
 		}
-		if e = a.write(x[0], z, metadata{1, x[0], "help", exe, help, "", "flat-options-v1"}); e != nil {
+		m := metadata{Version: 1, Tool: x[0], Source: "help", Executable: exe, Args: help, Parser: "command-tree-v1", MaxDepth: limits.MaxDepth, MaxCommands: limits.MaxCommands, MaxOutput: limits.MaxOutput}
+		if e = a.write(x[0], z, m); e != nil {
 			return e
 		}
 		fmt.Fprintln(c.OutOrStdout(), paint(useColor.out, "32", "generated"), x[0])
@@ -604,6 +624,15 @@ func (a *app) generate() *cobra.Command {
 	}}
 	c.Flags().StringSliceVar(&help, "help-arg", nil, "help argument (repeatable or comma-separated)")
 	c.Flags().BoolVar(&force, "force", false, "generate from help even when a native generator exists")
+	c.Flags().IntVar(&limits.MaxDepth, "max-depth", limits.MaxDepth, "maximum subcommand depth to inspect")
+	c.Flags().IntVar(&limits.MaxCommands, "max-commands", limits.MaxCommands, "maximum help commands to run")
+	c.Flags().Int64Var(&limits.MaxOutput, "max-output", limits.MaxOutput, "maximum total help output in bytes")
+	c.PreRunE = func(_ *cobra.Command, _ []string) error {
+		if limits.MaxDepth < 0 || limits.MaxCommands < 1 || limits.MaxOutput < 1 {
+			return errors.New("discovery limits must be positive (max-depth may be zero)")
+		}
+		return nil
+	}
 	return c
 }
 
@@ -642,7 +671,71 @@ type parsedOption struct {
 	Action             optionAction
 	Choices            []string
 }
-type parsedCommand struct{ Options []parsedOption }
+type parsedSubcommand struct{ Name, Description string }
+type parsedCommand struct {
+	Options     []parsedOption
+	Subcommands []parsedSubcommand
+}
+
+type commandNode struct {
+	Path    []string
+	Command parsedCommand
+}
+type commandTree struct{ Nodes []commandNode }
+type discoveryLimits struct {
+	MaxDepth, MaxCommands int
+	MaxOutput             int64
+}
+
+// discoverHelp walks only subcommands emitted by parseHelp's recognized
+// sections. Arguments are passed directly to exec: no help text is ever
+// evaluated or converted into a shell command.
+func (a *app) discoverHelp(exe string, helpArgs []string, limits discoveryLimits) (commandTree, error) {
+	if limits.MaxDepth < 0 || limits.MaxCommands < 1 || limits.MaxOutput < 1 {
+		return commandTree{}, errors.New("invalid discovery limits")
+	}
+	queue := [][]string{{}}
+	seen := map[string]bool{"": true}
+	remaining := limits.MaxOutput
+	var tree commandTree
+	for len(queue) > 0 {
+		if len(tree.Nodes) >= limits.MaxCommands {
+			return commandTree{}, fmt.Errorf("command count exceeds limit of %d", limits.MaxCommands)
+		}
+		path := queue[0]
+		queue = queue[1:]
+		args := append(append([]string{}, path...), helpArgs...)
+		b, err := captureLimit(exe, args, a.timeout, remaining)
+		if err != nil {
+			return commandTree{}, fmt.Errorf("help for %s: %w", commandLabel(path), err)
+		}
+		remaining -= int64(len(b))
+		command, err := parseHelp(b)
+		if err != nil {
+			return commandTree{}, fmt.Errorf("help for %s: %w", commandLabel(path), err)
+		}
+		tree.Nodes = append(tree.Nodes, commandNode{Path: append([]string{}, path...), Command: command})
+		if len(path) >= limits.MaxDepth {
+			continue
+		}
+		for _, sub := range command.Subcommands {
+			child := append(append([]string{}, path...), sub.Name)
+			key := strings.Join(child, "\x00")
+			if !seen[key] {
+				seen[key] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+	return tree, nil
+}
+
+func commandLabel(path []string) string {
+	if len(path) == 0 {
+		return "root command"
+	}
+	return "subcommand " + strings.Join(path, " ")
+}
 
 func parseHelp(b []byte) (parsedCommand, error) {
 	if bytes.IndexFunc(b, func(r rune) bool { return r < 32 && r != '\n' && r != '\t' && r != '\r' }) >= 0 {
@@ -650,6 +743,7 @@ func parseHelp(b []byte) (parsedCommand, error) {
 	}
 	var command parsedCommand
 	lines := strings.Split(string(b), "\n")
+	parseSubcommandSections(lines, &command)
 	for i, ln := range lines {
 		parts := optionSeparator.Split(strings.TrimSpace(ln), 2)
 		if !strings.HasPrefix(parts[0], "-") {
@@ -716,10 +810,41 @@ func parseHelp(b []byte) (parsedCommand, error) {
 		}
 		command.Options = append(command.Options, o)
 	}
-	if len(command.Options) == 0 {
-		return parsedCommand{}, errors.New("no recognizable options in help output")
+	if len(command.Options) == 0 && len(command.Subcommands) == 0 {
+		return parsedCommand{}, errors.New("no recognizable options or subcommands in help output")
 	}
 	return command, nil
+}
+
+var subcommandHeadings = map[string]bool{
+	"Commands:": true, "Available Commands:": true, "Subcommands:": true,
+}
+
+// parseSubcommandSections deliberately accepts only established section
+// headings and same-line "name  description" rows. Usage text, prose, aliases,
+// and unfamiliar layouts are never inferred as commands.
+func parseSubcommandSections(lines []string, command *parsedCommand) {
+	for i := 0; i < len(lines); i++ {
+		if !subcommandHeadings[strings.TrimSpace(lines[i])] {
+			continue
+		}
+		for i++; i < len(lines); i++ {
+			line := lines[i]
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if line == strings.TrimLeft(line, " \t") {
+				i--
+				break
+			}
+			parts := optionSeparator.Split(trimmed, 2)
+			if len(parts) != 2 || strings.ContainsAny(parts[0], " \t,") || !nameOK(parts[0]) || strings.TrimSpace(parts[1]) == "" {
+				continue
+			}
+			command.Subcommands = append(command.Subcommands, parsedSubcommand{parts[0], strings.TrimSpace(parts[1])})
+		}
+	}
 }
 
 var (
@@ -788,6 +913,14 @@ func renderZsh(tool string, command parsedCommand) ([]byte, error) {
 	if !nameOK(tool) {
 		return nil, errors.New("invalid tool name")
 	}
+	specs := renderOptionSpecs(command)
+	if len(specs) == 0 {
+		return nil, errors.New("no options")
+	}
+	return []byte("#compdef " + tool + "\n# help-derived: conservative flat options only\n_arguments \\\n  " + strings.Join(specs, " \\\n  ") + "\n"), nil
+}
+
+func renderOptionSpecs(command parsedCommand) []string {
 	var specs []string
 	for _, o := range command.Options {
 		if len(o.Aliases) == 0 {
@@ -819,11 +952,56 @@ func renderZsh(tool string, command parsedCommand) ([]byte, error) {
 			specs = append(specs, "'("+strings.Join(o.Aliases, " ")+")'{"+strings.Join(o.Aliases, ",")+"}'"+body+"'")
 		}
 	}
-	if len(specs) == 0 {
-		return nil, errors.New("no options")
-	}
-	return []byte("#compdef " + tool + "\n# help-derived: conservative flat options only\n_arguments \\\n  " + strings.Join(specs, " \\\n  ") + "\n"), nil
+	return specs
 }
+
+func renderTree(tool string, tree commandTree) ([]byte, error) {
+	if !nameOK(tool) || len(tree.Nodes) == 0 {
+		return nil, errors.New("empty command tree")
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "#compdef %s\n# help-derived: recognized command sections and options only\n_completionctl_generated() {\n", tool)
+	b.WriteString("  local context state line _cc_key='' _cc_i=2\n  typeset -A opt_args\n")
+	// Consume only an exact, recognized command prefix. Once flags or unknown
+	// positionals begin, dispatch remains at the last confirmed node.
+	b.WriteString("  while (( _cc_i < CURRENT )); do\n    case \"$_cc_key|${words[_cc_i]}\" in\n")
+	for _, n := range tree.Nodes {
+		parent := strings.Join(n.Path, " ")
+		for _, sub := range n.Command.Subcommands {
+			child := strings.TrimSpace(parent + " " + sub.Name)
+			fmt.Fprintf(&b, "      %s) _cc_key=%s ;;\n", zshCaseWord(parent+"|"+sub.Name), zshWordUnsafe(child))
+		}
+	}
+	b.WriteString("      *) break ;;\n    esac\n    (( _cc_i++ ))\n  done\n  case \"$_cc_key\" in\n")
+	for _, n := range tree.Nodes {
+		key := strings.Join(n.Path, " ")
+		fmt.Fprintf(&b, "    %s)\n", zshCaseWord(key))
+		if len(n.Path) > 0 {
+			fmt.Fprintf(&b, "      words=(\"$words[1]\" \"${words[%d,-1]}\")\n      (( CURRENT -= %d ))\n", len(n.Path)+2, len(n.Path))
+		}
+		specs := renderOptionSpecs(n.Command)
+		if len(n.Command.Subcommands) > 0 {
+			specs = append(specs, "'1:command:->commands'")
+		}
+		if len(specs) > 0 {
+			fmt.Fprintf(&b, "      _arguments -C \\\n        %s && return\n", strings.Join(specs, " \\\n        "))
+		}
+		if len(n.Command.Subcommands) > 0 {
+			b.WriteString("      if [[ $state == commands ]]; then\n        local -a _cc_commands=(\n")
+			for _, sub := range n.Command.Subcommands {
+				fmt.Fprintf(&b, "          %s\n", zshWordUnsafe(sub.Name+":"+sub.Description))
+			}
+			b.WriteString("        )\n        _describe 'command' _cc_commands\n      fi\n")
+		}
+		b.WriteString("      ;;\n")
+	}
+	b.WriteString("  esac\n}\n")
+	b.WriteString("_completionctl_generated \"$@\"\n")
+	return []byte(b.String()), nil
+}
+
+func zshWordUnsafe(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
+func zshCaseWord(s string) string   { return zshWordUnsafe(s) }
 func renderHelp(tool string, b []byte) ([]byte, error) {
 	c, e := parseHelp(b)
 	if e != nil {

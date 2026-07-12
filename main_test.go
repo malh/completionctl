@@ -158,10 +158,87 @@ func TestParseHelpSameLinePossibleValues(t *testing.T) {
 }
 
 func TestParseHelpRejectsUnsafeAndRequiresOption(t *testing.T) {
-	for _, input := range []string{"Commands:\n run  desc", "--color <ok|$(bad)>  desc", "--x X\x00  desc"} {
+	for _, input := range []string{"Tasks:\n run  desc", "--color <ok|$(bad)>  desc", "--x X\x00  desc"} {
 		if _, err := parseHelp([]byte(input)); err == nil {
 			t.Errorf("accepted %q", input)
 		}
+	}
+}
+
+func TestParseRecognizedSubcommandSectionsOnly(t *testing.T) {
+	got, err := parseHelp([]byte("Usage: tool COMMAND\nAvailable Commands:\n  run     Run work\n  config  Manage config\n\nExamples:\n  tool made-up  prose\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []parsedSubcommand{{"run", "Run work"}, {"config", "Manage config"}}
+	if !reflect.DeepEqual(got.Subcommands, want) {
+		t.Fatalf("subcommands=%#v", got.Subcommands)
+	}
+	for _, unsafe := range []string{
+		"Tasks:\n  run  Run work",
+		"Commands:\n  run, r  Run work",
+		"Commands:\n  run",
+	} {
+		if _, err := parseHelp([]byte(unsafe)); err == nil {
+			t.Fatalf("accepted unrecognized command grammar %q", unsafe)
+		}
+	}
+}
+
+func TestDiscoverHelpRecursesAndHonorsLimits(t *testing.T) {
+	bin := t.TempDir()
+	tool := filepath.Join(bin, "tool")
+	log := filepath.Join(bin, "calls")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_LOG"
+case "$*" in
+  --help) printf '%s\n' 'Options:' '  --root  root option' 'Commands:' '  alpha  Alpha command' ;;
+  'alpha --help') printf '%s\n' 'Options:' '  --child FILE  child option' 'Subcommands:' '  deep  Deep command' ;;
+  'alpha deep --help') printf '%s\n' 'Options:' '  --leaf DIR  leaf option' ;;
+  *) exit 4 ;;
+esac
+`
+	if err := os.WriteFile(tool, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_LOG", log)
+	a := app{timeout: time.Second}
+	tree, err := a.discoverHelp(tool, []string{"--help"}, discoveryLimits{MaxDepth: 2, MaxCommands: 3, MaxOutput: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.Nodes) != 3 || strings.Join(tree.Nodes[2].Path, " ") != "alpha deep" {
+		t.Fatalf("tree=%#v", tree)
+	}
+	calls, _ := os.ReadFile(log)
+	if string(calls) != "--help\nalpha --help\nalpha deep --help\n" {
+		t.Fatalf("calls=%q", calls)
+	}
+	if _, err := a.discoverHelp(tool, []string{"--help"}, discoveryLimits{MaxDepth: 2, MaxCommands: 2, MaxOutput: 4096}); err == nil || !strings.Contains(err.Error(), "command count") {
+		t.Fatalf("command limit error=%v", err)
+	}
+	if _, err := a.discoverHelp(tool, []string{"--help"}, discoveryLimits{MaxDepth: 2, MaxCommands: 3, MaxOutput: 10}); err == nil {
+		t.Fatal("output limit was not enforced")
+	}
+}
+
+func TestRenderTreeContainsContextSpecificOptions(t *testing.T) {
+	tree := commandTree{Nodes: []commandNode{
+		{Command: parsedCommand{Options: []parsedOption{{Aliases: []string{"--root"}, Description: "root"}}, Subcommands: []parsedSubcommand{{"run", "Run it"}}}},
+		{Path: []string{"run"}, Command: parsedCommand{Options: []parsedOption{{Aliases: []string{"--child"}, Description: "child"}}}},
+	}}
+	b, err := renderTree("tool", tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{"'|run'", "'run')", "--root", "--child", "_describe 'command'"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %q in %s", want, s)
+		}
+	}
+	if err := validate("tool", b); err != nil {
+		t.Fatal(err)
 	}
 }
 

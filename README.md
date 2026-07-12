@@ -57,7 +57,7 @@ your `fpath` before `compinit` runs.
 | Command | What it does |
 |---|---|
 | `install TOOL` | Try a curated list of native generator invocations (`completion zsh`, `completions --shell zsh`, …) and install the first valid result. `--generator-arg` supplies a nonstandard invocation. |
-| `generate TOOL` | Run `TOOL --help` (or `--help-arg`) and build a completion from the recognized flags. Never invoked implicitly. |
+| `generate TOOL` | Starting at `TOOL --help` (or `--help-arg`), discover recognized subcommand sections recursively and build a context-aware completion. Never invoked implicitly. |
 | `update [TOOL]` | Re-run each definition's recorded generation — native command, help invocation, or import source — and replace it only if the result validates. |
 | `list` | Show managed definitions, their source kind, and anything they shadow. |
 | `inspect TOOL` | Full provenance as JSON. |
@@ -90,7 +90,11 @@ you can generate one from its help output instead:
 ### generate — help parsing, explicitly
 
 `generate` parses GNU/BSD option tables and the two-line layouts used by
-clap and Commander, including `[possible values: …]` annotations:
+clap and Commander, including `[possible values: …]` annotations. When it
+finds a recognized `Commands:`, `Available Commands:`, or `Subcommands:`
+section, it runs each listed command with the same help argument and repeats
+the process. Thus `tool run --help` supplies the options offered after
+`tool run`, independently of the root options:
 
 ```
 ❱ completionctl generate fnm --force   # fnm has a native command; forced for illustration
@@ -100,11 +104,29 @@ generated fnm
   '--log-level[The log level of fnm commands]:LOG_LEVEL:(quiet error info)' \
 ```
 
-It is deliberately conservative: unrecognized grammar (subcommands, unusual
-layouts) is omitted rather than guessed, positionals are never assumed to be
-files, and descriptions are rendered inert — help text can't inject code into
-your shell. If the tool has a working native command, `generate` refuses and
-points you at `install` unless you pass `--force`.
+Discovery is bounded and configurable:
+
+| Flag | Default | Limit |
+|---|---:|---|
+| `--max-depth` | `3` | deepest subcommand help level inspected (`0` runs only the root help) |
+| `--max-commands` | `64` | total help commands run, including the root |
+| `--timeout` | `5s` | wall-clock limit for each help command |
+| `--max-output` | `4194304` | cumulative help bytes accepted across the tree |
+
+These settings are recorded in managed metadata, so `update` uses the same
+depth, command-count, and output policy. `--timeout` remains a global runtime
+override for all subprocess-based operations.
+
+It is deliberately conservative: only the three exact headings above and
+indented `name  description` rows are recognized as subcommands. Aliases,
+multi-word command columns, missing descriptions, unrecognized headings, and
+unusual layouts are omitted rather than guessed. Positionals are never assumed
+to be files, and descriptions are rendered inert — help text can't inject code
+into your shell. Reaching the depth limit leaves deeper commands listed but
+does not inspect their options; exceeding the command-count, output-size, or
+timeout limit fails generation without replacing the installed definition. If
+the tool has a working native command, `generate` refuses and points you at
+`install` unless you pass `--force`.
 
 ### Provenance
 
@@ -182,7 +204,8 @@ tab completion works through the wrapper.
 
 - `install` and `generate` **execute the target tool** with your privileges.
   Execution is explicit (never a silent fallback), stdin is closed, output is
-  size-capped, and runs are killed after `--timeout` (default 5s) — but this
+  size-capped (cumulatively during recursive discovery), and runs are killed
+  after `--timeout` (default 5s) — but this
   is not a sandbox. Don't point it at binaries you don't trust.
 - Candidates must be non-empty, declare the intended `#compdef`, contain no
   control characters, and pass `zsh -n` before an atomic rename replaces the
