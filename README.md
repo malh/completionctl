@@ -115,7 +115,9 @@ Discovery is bounded and configurable:
 
 These settings are recorded in managed metadata, so `update` uses the same
 depth, command-count, and output policy. `--timeout` remains a global runtime
-override for all subprocess-based operations.
+override for all subprocess-based operations. While discovery is running in an
+interactive terminal, `generate` displays a spinner on stderr; redirected and
+piped output remains unchanged.
 
 It is deliberately conservative: only the three exact headings above and
 indented `name  description` rows are recognized as subcommands. In sections
@@ -124,11 +126,13 @@ the current command's direct children. Aliases,
 multi-word command columns, missing descriptions, unrecognized headings, and
 unusual layouts are omitted rather than guessed. Positionals are never assumed
 to be files, and descriptions are rendered inert — help text can't inject code
-into your shell. Reaching the depth limit leaves deeper commands listed but
-does not inspect their options; exceeding the command-count, output-size, or
-timeout limit fails generation without replacing the installed definition. If
-the tool has a working native command, `generate` refuses and points you at
-`install` unless you pass `--force`.
+into your shell. Advertised subcommands whose help command fails or has no
+recognizable structure remain listed but are not inspected. Reaching the depth
+limit similarly leaves deeper commands listed without inspecting their options;
+exceeding the command-count, output-size, or timeout limit fails generation
+without replacing the installed definition. If the tool has a working native
+command, `generate` refuses and points you at `install` unless you pass
+`--force`.
 
 ### Provenance
 

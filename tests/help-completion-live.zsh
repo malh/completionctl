@@ -13,6 +13,7 @@ cat >"$tmp/bin/faketool" <<'EOF'
 case "$*" in
   --help)
     printf '  -o, --output <FILE>  Write output\n'
+	printf '  --verbose  Enable verbose output\n'
     printf '  --visibility <visibility>\n      Set thread visibility (private, unlisted, workspace, group)\n'
     printf '  --mode <fast|slow>  Select mode\n'
     printf 'Commands:\n  run  Run a job\n'
@@ -54,7 +55,8 @@ for want in -- --output --visibility --mode; do
 done
 
 # The dispatcher selects options from the confirmed nested command path.
-zpty -wn comp $'faketool run deep --\t'
+# Global flags before the command path must not pin dispatch at the root.
+zpty -wn comp $'faketool --verbose run deep --\t'
 zpty -wn comp $'\n'
 zpty -w comp "print 'LEAF''MARKER'"
 zpty -r comp nested "*LEAFMARKER*"

@@ -243,6 +243,40 @@ esac
 	}
 }
 
+func TestDiscoverHelpSkipsUnsupportedAdvertisedCommand(t *testing.T) {
+	bin := t.TempDir()
+	tool := filepath.Join(bin, "tool")
+	script := `#!/bin/sh
+case "$*" in
+  --help) printf '%s\n' 'Commands:' '  good  Works' '  plugin  External plugin' ;;
+  'good --help') printf '%s\n' 'Options:' '  --ok  works' ;;
+  'plugin --help') exit 2 ;;
+esac
+`
+	if err := os.WriteFile(tool, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := app{timeout: time.Second}
+	tree, err := a.discoverHelp(tool, []string{"--help"}, discoveryLimits{MaxDepth: 1, MaxCommands: 3, MaxOutput: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.Nodes) != 2 || strings.Join(tree.Nodes[1].Path, " ") != "good" {
+		t.Fatalf("tree=%#v", tree)
+	}
+}
+
+func TestCaptureLimitIsSharedAcrossOutputStreams(t *testing.T) {
+	tool := filepath.Join(t.TempDir(), "tool")
+	script := "#!/bin/sh\nprintf '%080d' 0\nprintf '%080d' 0 >&2\n"
+	if err := os.WriteFile(tool, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureLimit(tool, nil, time.Second, 100); err == nil || !strings.Contains(err.Error(), "output exceeds limit") {
+		t.Fatalf("shared output limit error=%v", err)
+	}
+}
+
 func TestRenderTreeContainsContextSpecificOptions(t *testing.T) {
 	tree := commandTree{Nodes: []commandNode{
 		{Command: parsedCommand{Options: []parsedOption{{Aliases: []string{"--root"}, Description: "root"}}, Subcommands: []parsedSubcommand{{"run", "Run it"}}}},
@@ -260,6 +294,26 @@ func TestRenderTreeContainsContextSpecificOptions(t *testing.T) {
 	}
 	if err := validate("tool", b); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRenderTreeAllowsOptionsBeforeSubcommands(t *testing.T) {
+	tree := commandTree{Nodes: []commandNode{
+		{Command: parsedCommand{
+			Options:     []parsedOption{{Aliases: []string{"--config"}, Cardinality: valueRequired}},
+			Subcommands: []parsedSubcommand{{"run", "Run it"}},
+		}},
+		{Path: []string{"run"}, Command: parsedCommand{Options: []parsedOption{{Aliases: []string{"--child"}}}}},
+	}}
+	b, err := renderTree("tool", tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	// Keep the assertions tied to dispatch behavior rather than the complete
+	// generated function.
+	if !strings.Contains(s, "'|--config') (( _cc_i++ ))") || !strings.Contains(s, "*'|-'*) ;;") {
+		t.Fatal(s)
 	}
 }
 
@@ -412,6 +466,23 @@ func TestPaintRespectsToggle(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	if isTTY(os.Stdout) {
 		t.Fatal("NO_COLOR did not disable colors")
+	}
+}
+
+func TestProgressSpinnerCanStopCleanly(t *testing.T) {
+	var out bytes.Buffer
+	spinner := startSpinner(&out, "Discovering tool commands…", true)
+	spinner.Stop()
+	spinner.Stop()
+	got := out.String()
+	if !strings.Contains(got, "Discovering tool commands…") || !strings.HasSuffix(got, "\r\033[K") {
+		t.Fatalf("spinner output=%q", got)
+	}
+
+	out.Reset()
+	startSpinner(&out, "hidden", false).Stop()
+	if out.Len() != 0 {
+		t.Fatalf("disabled spinner wrote %q", out.String())
 	}
 }
 

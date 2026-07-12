@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -80,6 +81,60 @@ func paint(on bool, code, s string) string {
 		return s
 	}
 	return "\x1b[" + code + "m" + s + "\x1b[0m"
+}
+
+type progressSpinner struct {
+	once    sync.Once
+	done    chan struct{}
+	stopped chan struct{}
+	w       io.Writer
+	enabled bool
+}
+
+func spinnerTTY(f *os.File) bool {
+	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	st, err := f.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
+func startSpinner(w io.Writer, label string, enabled bool) *progressSpinner {
+	s := &progressSpinner{w: w, enabled: enabled}
+	if !enabled {
+		return s
+	}
+	s.done = make(chan struct{})
+	s.stopped = make(chan struct{})
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	fmt.Fprintf(w, "\r%s %s", frames[0], label)
+	go func() {
+		defer close(s.stopped)
+		ticker := time.NewTicker(80 * time.Millisecond)
+		defer ticker.Stop()
+		i := 1
+		for {
+			select {
+			case <-ticker.C:
+				fmt.Fprintf(w, "\r%s %s", frames[i%len(frames)], label)
+				i++
+			case <-s.done:
+				return
+			}
+		}
+	}()
+	return s
+}
+
+func (s *progressSpinner) Stop() {
+	if !s.enabled {
+		return
+	}
+	s.once.Do(func() {
+		close(s.done)
+		<-s.stopped
+		fmt.Fprint(s.w, "\r\033[K")
+	})
 }
 
 // suggest appends copy-pasteable commands to a message, each bare on its own
@@ -219,13 +274,17 @@ func captureLimit(path string, args []string, d time.Duration, limit int64) ([]b
 	c := exec.CommandContext(ctx, path, args...)
 	c.Stdin = nil
 	var out, er bytes.Buffer
-	c.Stdout = &limited{w: &out, n: limit}
-	c.Stderr = &limited{w: &er, n: limit}
+	budget := &outputBudget{n: limit}
+	c.Stdout = &limited{w: &out, budget: budget}
+	c.Stderr = &limited{w: &er, budget: budget}
 	e := c.Run()
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("command timed out")
 	}
 	if e != nil {
+		if strings.Contains(e.Error(), "output exceeds limit") {
+			return nil, errors.New("output exceeds limit")
+		}
 		// The tool's own stderr explains the failure better than an exit code;
 		// fall back to the exec error only when the command died silently.
 		if msg := stripErrorPrefix(er.String()); msg != "" {
@@ -250,16 +309,23 @@ func stripErrorPrefix(s string) string {
 }
 
 type limited struct {
-	w io.Writer
-	n int64
+	w      io.Writer
+	budget *outputBudget
+}
+
+type outputBudget struct {
+	mu sync.Mutex
+	n  int64
 }
 
 func (l *limited) Write(p []byte) (int, error) {
-	if int64(len(p)) > l.n {
+	l.budget.mu.Lock()
+	defer l.budget.mu.Unlock()
+	if int64(len(p)) > l.budget.n {
 		return 0, errors.New("output exceeds limit")
 	}
 	n, e := l.w.Write(p)
-	l.n -= int64(n)
+	l.budget.n -= int64(n)
 	return n, e
 }
 func validate(tool string, b []byte) error {
@@ -341,12 +407,25 @@ func (a *app) write(tool string, b []byte, m metadata) error {
 		e = f.Chmod(0644)
 	}
 	if e == nil {
+		e = f.Sync()
+	}
+	if e == nil {
 		e = f.Close()
 	} else {
 		f.Close()
 	}
 	if e == nil {
 		e = os.Rename(n, p)
+	}
+	if e == nil {
+		if d, de := os.Open(a.dir); de != nil {
+			fmt.Fprintf(os.Stderr, "%s %s installed but completion directory was not synced: %v\n", paint(useColor.err, "1;33", "warning:"), tool, de)
+		} else {
+			if de = d.Sync(); de != nil {
+				fmt.Fprintf(os.Stderr, "%s %s installed but completion directory was not synced: %v\n", paint(useColor.err, "1;33", "warning:"), tool, de)
+			}
+			_ = d.Close()
+		}
 	}
 	if e == nil {
 		// The definition is installed at this point; a failed event write only
@@ -447,6 +526,7 @@ func (a *app) updateOne(tool string) error {
 func (a *app) update() *cobra.Command {
 	return &cobra.Command{Use: "update [TOOL]", Args: cobra.MaximumNArgs(1), RunE: func(c *cobra.Command, x []string) error {
 		tools := x
+		var fails []string
 		if len(tools) == 0 {
 			es, er := os.ReadDir(a.dir)
 			if er != nil && !os.IsNotExist(er) {
@@ -456,7 +536,7 @@ func (a *app) update() *cobra.Command {
 				if strings.HasPrefix(e.Name(), "_") && !e.IsDir() {
 					b, re := os.ReadFile(filepath.Join(a.dir, e.Name()))
 					if re != nil {
-						tools = append(tools, strings.TrimPrefix(e.Name(), "_"))
+						fails = append(fails, e.Name()+": "+re.Error())
 						continue
 					}
 					if _, er := decode(b); er == nil {
@@ -468,7 +548,6 @@ func (a *app) update() *cobra.Command {
 			}
 			sort.Strings(tools)
 		}
-		var fails []string
 		for _, t := range tools {
 			if e := a.updateOne(t); e != nil {
 				fails = append(fails, t+": "+e.Error())
@@ -598,6 +677,10 @@ func (a *app) generate() *cobra.Command {
 			if e := a.shadowGuard(x[0], "completionctl generate --force "+x[0]); e != nil {
 				return e
 			}
+		}
+		spinner := startSpinner(c.ErrOrStderr(), "Discovering "+x[0]+" commands…", c.ErrOrStderr() == os.Stderr && spinnerTTY(os.Stderr))
+		defer spinner.Stop()
+		if !force {
 			for _, ar := range nativeArgs {
 				if b, e := capture(exe, ar, a.timeout); e == nil && validate(x[0], b) == nil {
 					return errors.New(suggest(useColor.err,
@@ -615,6 +698,7 @@ func (a *app) generate() *cobra.Command {
 		if e != nil {
 			return e
 		}
+		spinner.Stop()
 		m := metadata{Version: 1, Tool: x[0], Source: "help", Executable: exe, Args: help, Parser: "command-tree-v1", MaxDepth: limits.MaxDepth, MaxCommands: limits.MaxCommands, MaxOutput: limits.MaxOutput}
 		if e = a.write(x[0], z, m); e != nil {
 			return e
@@ -707,11 +791,17 @@ func (a *app) discoverHelp(exe string, helpArgs []string, limits discoveryLimits
 		args := append(append([]string{}, path...), helpArgs...)
 		b, err := captureLimit(exe, args, a.timeout, remaining)
 		if err != nil {
+			if len(path) > 0 && !isDiscoveryLimitError(err) {
+				continue
+			}
 			return commandTree{}, fmt.Errorf("help for %s: %w", commandLabel(path), err)
 		}
 		remaining -= int64(len(b))
 		command, err := parseHelp(b)
 		if err != nil {
+			if len(path) > 0 {
+				continue
+			}
 			return commandTree{}, fmt.Errorf("help for %s: %w", commandLabel(path), err)
 		}
 		tree.Nodes = append(tree.Nodes, commandNode{Path: append([]string{}, path...), Command: command})
@@ -728,6 +818,11 @@ func (a *app) discoverHelp(exe string, helpArgs []string, limits discoveryLimits
 		}
 	}
 	return tree, nil
+}
+
+func isDiscoveryLimitError(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "timed out") || strings.Contains(s, "output exceeds limit")
 }
 
 func commandLabel(path []string) string {
@@ -979,23 +1074,32 @@ func renderTree(tool string, tree commandTree) ([]byte, error) {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "#compdef %s\n# help-derived: recognized command sections and options only\n_completionctl_generated() {\n", tool)
-	b.WriteString("  local context state line _cc_key='' _cc_i=2\n  typeset -A opt_args\n")
-	// Consume only an exact, recognized command prefix. Once flags or unknown
-	// positionals begin, dispatch remains at the last confirmed node.
+	b.WriteString("  local context state line _cc_key='' _cc_i=2 _cc_start=2\n  typeset -A opt_args\n")
+	// Consume a recognized command path while allowing options before commands.
+	// Required option arguments are skipped so a value matching a command name
+	// cannot accidentally change completion context.
 	b.WriteString("  while (( _cc_i < CURRENT )); do\n    case \"$_cc_key|${words[_cc_i]}\" in\n")
 	for _, n := range tree.Nodes {
 		parent := strings.Join(n.Path, " ")
 		for _, sub := range n.Command.Subcommands {
 			child := strings.TrimSpace(parent + " " + sub.Name)
-			fmt.Fprintf(&b, "      %s) _cc_key=%s ;;\n", zshCaseWord(parent+"|"+sub.Name), zshWordUnsafe(child))
+			fmt.Fprintf(&b, "      %s) _cc_key=%s; _cc_start=$((_cc_i + 1)) ;;\n", zshCaseWord(parent+"|"+sub.Name), zshWordUnsafe(child))
+		}
+		for _, option := range n.Command.Options {
+			if option.Cardinality != valueRequired {
+				continue
+			}
+			for _, alias := range option.Aliases {
+				fmt.Fprintf(&b, "      %s) (( _cc_i++ )) ;;\n", zshCaseWord(parent+"|"+alias))
+			}
 		}
 	}
-	b.WriteString("      *) break ;;\n    esac\n    (( _cc_i++ ))\n  done\n  case \"$_cc_key\" in\n")
+	b.WriteString("      *'|-'*) ;;\n      *) break ;;\n    esac\n    (( _cc_i++ ))\n  done\n  case \"$_cc_key\" in\n")
 	for _, n := range tree.Nodes {
 		key := strings.Join(n.Path, " ")
 		fmt.Fprintf(&b, "    %s)\n", zshCaseWord(key))
 		if len(n.Path) > 0 {
-			fmt.Fprintf(&b, "      words=(\"$words[1]\" \"${words[%d,-1]}\")\n      (( CURRENT -= %d ))\n", len(n.Path)+2, len(n.Path))
+			b.WriteString("      words=(\"$words[1]\" \"${words[_cc_start,-1]}\")\n      (( CURRENT -= _cc_start - 2 ))\n")
 		}
 		specs := renderOptionSpecs(n.Command)
 		if len(n.Command.Subcommands) > 0 {
