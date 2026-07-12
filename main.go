@@ -582,7 +582,7 @@ func firstLine(s string) string {
 func (a *app) generate() *cobra.Command {
 	var help []string
 	var force bool
-	limits := discoveryLimits{MaxDepth: 3, MaxCommands: 64, MaxOutput: maxOutput}
+	limits := discoveryLimits{MaxDepth: 3, MaxCommands: 128, MaxOutput: maxOutput}
 	c := &cobra.Command{Use: "generate TOOL", Args: cobra.ExactArgs(1), RunE: func(c *cobra.Command, x []string) error {
 		if len(help) == 0 {
 			help = []string{"--help"}
@@ -828,6 +828,12 @@ func parseSubcommandSections(lines []string, command *parsedCommand) {
 		if !subcommandHeadings[strings.TrimSpace(lines[i])] {
 			continue
 		}
+		type row struct {
+			indent int
+			sub    parsedSubcommand
+		}
+		var rows []row
+		minIndent := int(^uint(0) >> 1)
 		for i++; i < len(lines); i++ {
 			line := lines[i]
 			trimmed := strings.TrimSpace(line)
@@ -842,7 +848,19 @@ func parseSubcommandSections(lines []string, command *parsedCommand) {
 			if len(parts) != 2 || strings.ContainsAny(parts[0], " \t,") || !nameOK(parts[0]) || strings.TrimSpace(parts[1]) == "" {
 				continue
 			}
-			command.Subcommands = append(command.Subcommands, parsedSubcommand{parts[0], strings.TrimSpace(parts[1])})
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			rows = append(rows, row{indent, parsedSubcommand{parts[0], strings.TrimSpace(parts[1])}})
+			if indent < minIndent {
+				minIndent = indent
+			}
+		}
+		// Some CLIs print the full hierarchy in one section. Only rows at the
+		// section's shallowest indentation are direct children; deeper rows are
+		// discovered by asking their parent for help.
+		for _, r := range rows {
+			if r.indent == minIndent {
+				command.Subcommands = append(command.Subcommands, r.sub)
+			}
 		}
 	}
 }
