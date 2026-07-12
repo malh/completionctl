@@ -109,7 +109,7 @@ Discovery is bounded and configurable:
 | Flag | Default | Limit |
 |---|---:|---|
 | `--max-depth` | `3` | deepest subcommand help level inspected (`0` runs only the root help) |
-| `--max-commands` | `64` | total help commands run, including the root |
+| `--max-commands` | `128` | total help commands run, including the root |
 | `--timeout` | `5s` | wall-clock limit for each help command |
 | `--max-output` | `4194304` | cumulative help bytes accepted across the tree |
 
@@ -118,7 +118,9 @@ depth, command-count, and output policy. `--timeout` remains a global runtime
 override for all subprocess-based operations.
 
 It is deliberately conservative: only the three exact headings above and
-indented `name  description` rows are recognized as subcommands. Aliases,
+indented `name  description` rows are recognized as subcommands. In sections
+that display a whole hierarchy, only the shallowest indentation is treated as
+the current command's direct children. Aliases,
 multi-word command columns, missing descriptions, unrecognized headings, and
 unusual layouts are omitted rather than guessed. Positionals are never assumed
 to be files, and descriptions are rendered inert — help text can't inject code

@@ -185,6 +185,27 @@ func TestParseRecognizedSubcommandSectionsOnly(t *testing.T) {
 	}
 }
 
+func TestParseSubcommandSectionUsesImmediateIndentationOnly(t *testing.T) {
+	help := `Commands:
+  orb       Manage orbs
+    service  Manage services
+      start  Start a service
+  threads   Manage threads
+    list     List threads
+
+Options:
+  --version  Print version
+`
+	got, err := parseHelp([]byte(help))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []parsedSubcommand{{"orb", "Manage orbs"}, {"threads", "Manage threads"}}
+	if !reflect.DeepEqual(got.Subcommands, want) {
+		t.Fatalf("subcommands=%#v, want %#v", got.Subcommands, want)
+	}
+}
+
 func TestDiscoverHelpRecursesAndHonorsLimits(t *testing.T) {
 	bin := t.TempDir()
 	tool := filepath.Join(bin, "tool")
